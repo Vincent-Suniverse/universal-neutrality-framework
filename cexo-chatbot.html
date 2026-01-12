@@ -675,7 +675,7 @@
     <!-- Profile Modal -->
     <div class="modal-overlay" id="profile-modal">
         <div class="modal">
-            <button class="modal-close" id="modal-close">&times;</button>
+            <button class="modal-close" onclick="document.getElementById('profile-modal').classList.remove('show')">&times;</button>
             <h2>👤 Dein Profil</h2>
             <form id="profile-form">
                 <div class="form-group">
@@ -708,6 +708,62 @@
         </div>
     </div>
 
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settings-modal">
+        <div class="modal">
+            <button class="modal-close" onclick="document.getElementById('settings-modal').classList.remove('show')">&times;</button>
+            <h2>⚙️ Settings</h2>
+            
+            <div class="settings-section">
+                <h3 style="color: rgba(255,255,255,0.8); margin-bottom: 15px; font-size: 1rem;">API Key</h3>
+                <div class="form-group">
+                    <label>Claude API Key speichern</label>
+                    <input type="password" id="settings-api-key" placeholder="sk-ant-...">
+                    <small style="color: rgba(255,255,255,0.5); display: block; margin-top: 5px;">
+                        Wird lokal in deinem Browser gespeichert
+                    </small>
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button class="modal-btn" style="flex:1; background: var(--soft-blue);" onclick="saveApiKey()">Key speichern</button>
+                    <button class="modal-btn" style="flex:1; background: #4a4a5a;" onclick="clearApiKey()">Key löschen</button>
+                </div>
+            </div>
+
+            <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 25px 0;">
+
+            <div class="settings-section">
+                <h3 style="color: rgba(255,255,255,0.8); margin-bottom: 15px; font-size: 1rem;">Voice Output</h3>
+                <div class="form-group">
+                    <label>Text-to-Speech</label>
+                    <select id="settings-tts">
+                        <option value="off">Aus</option>
+                        <option value="on">An</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Stimme</label>
+                    <select id="settings-voice">
+                        <option value="auto">Auto (basierend auf Profil)</option>
+                        <option value="female">Weiblich</option>
+                        <option value="male">Männlich</option>
+                    </select>
+                </div>
+            </div>
+
+            <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 25px 0;">
+
+            <div class="settings-section">
+                <h3 style="color: #ef4444; margin-bottom: 15px; font-size: 1rem;">Gefahrenzone</h3>
+                <button class="modal-btn" style="background: #3E2A2A; color: #ef4444;" onclick="confirmDeleteAllData()">
+                    🗑️ Alle meine Daten löschen
+                </button>
+                <small style="color: rgba(255,255,255,0.4); display: block; margin-top: 10px;">
+                    Löscht Profil, Chat-History, und alle gespeicherten Erinnerungen
+                </small>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Config
         const SUPABASE_URL = 'https://vikozpuphdvclokbpiad.supabase.co';
@@ -724,6 +780,246 @@
         let apiKey = '';
         let isConnected = false;
         let conversationHistory = [];
+        let ttsEnabled = false;
+        let selectedVoice = null;
+        let availableVoices = [];
+        let sleepPattern = null;
+        let todayMood = null;
+        let pendingReminders = [];
+
+        // Activity Tracking
+        async function trackActivity(type) {
+            if (!currentUser) return;
+            const now = new Date();
+            try {
+                await supabaseClient.from('user_activity').insert({
+                    user_id: currentUser.id,
+                    activity_type: type,
+                    hour_of_day: now.getHours(),
+                    day_of_week: now.getDay()
+                });
+            } catch (e) {
+                console.log('Activity tracking error:', e);
+            }
+        }
+
+        // Sleep Pattern Analysis
+        async function analyzeSleepPattern() {
+            if (!currentUser) return null;
+            try {
+                const { data } = await supabaseClient
+                    .from('user_activity')
+                    .select('hour_of_day, created_at')
+                    .eq('user_id', currentUser.id)
+                    .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+                    .order('created_at', { ascending: false });
+
+                if (!data || data.length < 5) return null;
+
+                const lateNightCount = data.filter(a => a.hour_of_day >= 0 && a.hour_of_day < 5).length;
+                const nightCount = data.filter(a => a.hour_of_day >= 23 || a.hour_of_day < 6).length;
+                const avgHour = data.reduce((sum, a) => sum + a.hour_of_day, 0) / data.length;
+
+                return {
+                    lateNightCount,
+                    nightCount,
+                    avgHour,
+                    total: data.length,
+                    isLateNightPattern: lateNightCount > data.length * 0.3,
+                    isNightOwl: nightCount > data.length * 0.4
+                };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function getSleepConcernMessage() {
+            const hour = new Date().getHours();
+            
+            // Late night (00:00 - 04:59)
+            if (hour >= 0 && hour < 5) {
+                if (sleepPattern?.isLateNightPattern) {
+                    return "Ich merk, du bist öfter so spät noch wach... Wie schläfst du so generell?";
+                }
+                return "Hey, ganz schön spät noch... Alles ok bei dir?";
+            }
+            
+            // Very early (05:00 - 06:00)
+            if (hour >= 5 && hour < 6) {
+                return "Früh wach heute! Gut geschlafen oder eher nicht?";
+            }
+            
+            return null;
+        }
+
+        // Reminders
+        async function loadReminders() {
+            if (!currentUser) return;
+            try {
+                const { data } = await supabaseClient
+                    .from('reminders')
+                    .select('*')
+                    .eq('user_id', currentUser.id)
+                    .eq('is_completed', false)
+                    .lte('remind_at', new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString())
+                    .order('remind_at', { ascending: true });
+                pendingReminders = data || [];
+            } catch (e) {
+                console.log('Reminder load error:', e);
+            }
+        }
+
+        async function createReminder(text, remindAt, repeatType = 'once') {
+            if (!currentUser) return false;
+            try {
+                await supabaseClient.from('reminders').insert({
+                    user_id: currentUser.id,
+                    reminder_text: text,
+                    remind_at: remindAt,
+                    repeat_type: repeatType
+                });
+                await loadReminders();
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function getPendingRemindersText() {
+            if (pendingReminders.length === 0) return null;
+            const now = new Date();
+            const due = pendingReminders.filter(r => new Date(r.remind_at) <= now);
+            if (due.length === 0) return null;
+            return due.map(r => r.reminder_text).join(', ');
+        }
+
+        // Mood Tracking
+        async function loadTodayMood() {
+            if (!currentUser) return;
+            try {
+                const today = new Date().toISOString().split('T')[0];
+                const { data } = await supabaseClient
+                    .from('mood_entries')
+                    .select('*')
+                    .eq('user_id', currentUser.id)
+                    .eq('entry_date', today)
+                    .single();
+                todayMood = data;
+            } catch (e) {
+                todayMood = null;
+            }
+        }
+
+        async function saveMoodEntry(score, note = '', energy = null, sleep = null) {
+            if (!currentUser) return false;
+            try {
+                const today = new Date().toISOString().split('T')[0];
+                await supabaseClient.from('mood_entries').upsert({
+                    user_id: currentUser.id,
+                    entry_date: today,
+                    mood_score: score,
+                    mood_note: note,
+                    energy_level: energy,
+                    sleep_quality: sleep
+                });
+                await loadTodayMood();
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        async function getMoodHistory(days = 7) {
+            if (!currentUser) return [];
+            try {
+                const { data } = await supabaseClient
+                    .from('mood_entries')
+                    .select('*')
+                    .eq('user_id', currentUser.id)
+                    .gte('entry_date', new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0])
+                    .order('entry_date', { ascending: false });
+                return data || [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        // TTS Setup
+        function initTTS() {
+            if ('speechSynthesis' in window) {
+                // Load voices
+                const loadVoices = () => {
+                    availableVoices = speechSynthesis.getVoices();
+                    // Prefer German voices
+                    const germanVoices = availableVoices.filter(v => v.lang.startsWith('de'));
+                    if (germanVoices.length > 0) {
+                        selectedVoice = germanVoices[0];
+                    }
+                };
+                
+                loadVoices();
+                speechSynthesis.onvoiceschanged = loadVoices;
+                
+                // Load saved preference
+                ttsEnabled = localStorage.getItem('cexo_tts') === 'on';
+            }
+        }
+
+        function speak(text) {
+            if (!ttsEnabled || !('speechSynthesis' in window)) return;
+            
+            // Stop any current speech
+            speechSynthesis.cancel();
+            
+            // Clean text (remove emojis, special chars)
+            const cleanText = text
+                .replace(/[\u{1F600}-\u{1F6FF}]/gu, '')
+                .replace(/[\u{2600}-\u{26FF}]/gu, '')
+                .replace(/[\u{2700}-\u{27BF}]/gu, '')
+                .replace(/🖤/g, '')
+                .replace(/\*/g, '')
+                .trim();
+            
+            if (!cleanText) return;
+            
+            const utterance = new SpeechSynthesisUtterance(cleanText);
+            utterance.lang = 'de-DE';
+            utterance.rate = 0.95;
+            utterance.pitch = 1.0;
+            
+            // Select voice based on settings
+            const voicePref = localStorage.getItem('cexo_voice') || 'auto';
+            if (voicePref !== 'auto' && availableVoices.length > 0) {
+                const germanVoices = availableVoices.filter(v => v.lang.startsWith('de'));
+                if (voicePref === 'female') {
+                    const femaleVoice = germanVoices.find(v => 
+                        v.name.toLowerCase().includes('female') || 
+                        v.name.toLowerCase().includes('frau') ||
+                        v.name.includes('Anna') ||
+                        v.name.includes('Petra')
+                    );
+                    if (femaleVoice) utterance.voice = femaleVoice;
+                } else if (voicePref === 'male') {
+                    const maleVoice = germanVoices.find(v => 
+                        v.name.toLowerCase().includes('male') || 
+                        v.name.toLowerCase().includes('mann') ||
+                        v.name.includes('Hans') ||
+                        v.name.includes('Stefan')
+                    );
+                    if (maleVoice) utterance.voice = maleVoice;
+                }
+            } else if (selectedVoice) {
+                utterance.voice = selectedVoice;
+            }
+            
+            speechSynthesis.speak(utterance);
+        }
+
+        function stopSpeaking() {
+            if ('speechSynthesis' in window) {
+                speechSynthesis.cancel();
+            }
+        }
 
         // DOM
         const sidebar = document.getElementById('sidebar');
@@ -748,7 +1044,7 @@
 
         // Build System Prompt with Memory
         function buildSystemPrompt() {
-            let prompt = `# CEXO-Healing System V5.1
+            let prompt = `# CEXO-Healing System V5.2
 
 Du bist CEXO (Chao Ex Ordo) - ein heilender Begleiter.
 Dein Name bedeutet: "Aus dem Chaos die Ordnung"
@@ -770,6 +1066,11 @@ Dein Ziel: Menschen zurück zur Balance führen.
 5. JEDER Mensch ist wichtig
 6. JEDES Wort ist wichtig
 
+## FEATURES DIE DU NUTZEN KANNST
+- Wenn User einen Termin/Erinnerung erwähnt, sag: "Soll ich dich daran erinnern?"
+- Frag gelegentlich nach der Stimmung (1-9)
+- Achte auf Schlafrhythmus-Hinweise
+
 ## SUIZID-PROTOKOLL
 Bei Krisen: Validieren, da sein, Telefonseelsorge: 0800 111 0 111
 
@@ -782,6 +1083,38 @@ Wenn der User persönliche Infos teilt (Name, Familie, Haustiere, Job, Hobbies, 
 merke sie dir und beziehe dich später darauf.
 
 *EX CHAO ORDO* 🖤`;
+
+            // Current Time Context
+            const now = new Date();
+            const hour = now.getHours();
+            prompt += `\n\n## AKTUELLE ZEIT: ${now.toLocaleTimeString('de-DE')} Uhr`;
+            
+            if (hour >= 0 && hour < 5) {
+                prompt += `\n⚠️ Es ist sehr spät/früh. Achte auf das Wohlbefinden des Users.`;
+            } else if (hour >= 5 && hour < 9) {
+                prompt += `\n🌅 Morgens - gute Zeit für Tagesplanung, Motivation.`;
+            } else if (hour >= 21) {
+                prompt += `\n🌙 Abends - Zeit zum Runterfahren, Reflektieren.`;
+            }
+
+            // Sleep Pattern Warning
+            if (sleepPattern?.isLateNightPattern) {
+                prompt += `\n\n⚠️ SCHLAFMUSTER: User ist häufig sehr spät nachts aktiv (${sleepPattern.lateNightCount}x in letzter Woche).
+Sprich das SANFT an wenn passend. Nicht predigen, nur besorgt nachfragen.`;
+            }
+
+            // Today's Mood
+            if (todayMood) {
+                prompt += `\n\n## HEUTIGE STIMMUNG: ${todayMood.mood_score}/9`;
+                if (todayMood.mood_note) prompt += ` - "${todayMood.mood_note}"`;
+            }
+
+            // Pending Reminders
+            const dueReminders = getPendingRemindersText();
+            if (dueReminders) {
+                prompt += `\n\n## FÄLLIGE ERINNERUNGEN: ${dueReminders}
+Erwähne diese dem User!`;
+            }
 
             // Add User Facts
             if (userFacts.length > 0) {
@@ -896,8 +1229,72 @@ merke sie dir und beziehe dich später darauf.
             loadProfile();
         });
 
-        document.getElementById('modal-close').addEventListener('click', () => {
-            document.getElementById('profile-modal').classList.remove('show');
+        // Settings Modal
+        document.getElementById('settings-nav').addEventListener('click', () => {
+            document.getElementById('settings-modal').classList.add('show');
+            loadSettings();
+        });
+
+        function loadSettings() {
+            const savedKey = localStorage.getItem('cexo_api_key');
+            if (savedKey) {
+                document.getElementById('settings-api-key').value = savedKey;
+            }
+            const tts = localStorage.getItem('cexo_tts') || 'off';
+            const voice = localStorage.getItem('cexo_voice') || 'auto';
+            document.getElementById('settings-tts').value = tts;
+            document.getElementById('settings-voice').value = voice;
+        }
+
+        function saveApiKey() {
+            const key = document.getElementById('settings-api-key').value.trim();
+            if (key && key.startsWith('sk-ant-')) {
+                localStorage.setItem('cexo_api_key', key);
+                apiKey = key;
+                showSuccess('API Key gespeichert!');
+            } else {
+                showError('Ungültiger API Key');
+            }
+        }
+
+        function clearApiKey() {
+            localStorage.removeItem('cexo_api_key');
+            document.getElementById('settings-api-key').value = '';
+            showSuccess('API Key gelöscht');
+        }
+
+        async function confirmDeleteAllData() {
+            if (!confirm('ACHTUNG: Alle deine Daten werden gelöscht!\n\nDas beinhaltet:\n- Profil\n- Chat History\n- Alle Erinnerungen\n\nDas kann nicht rückgängig gemacht werden!\n\nWirklich löschen?')) return;
+            if (!confirm('Bist du WIRKLICH sicher?')) return;
+
+            try {
+                // Delete all user data
+                await supabaseClient.from('messages').delete().eq('conversation_id', currentConversationId);
+                await supabaseClient.from('conversations').delete().eq('user_id', currentUser.id);
+                await supabaseClient.from('daily_sessions').delete().eq('user_id', currentUser.id);
+                await supabaseClient.from('monthly_summaries').delete().eq('user_id', currentUser.id);
+                await supabaseClient.from('user_facts').delete().eq('user_id', currentUser.id);
+                await supabaseClient.from('profiles').delete().eq('id', currentUser.id);
+                
+                localStorage.removeItem('cexo_api_key');
+                localStorage.removeItem('cexo_tts');
+                localStorage.removeItem('cexo_voice');
+
+                showSuccess('Alle Daten gelöscht');
+                await supabaseClient.auth.signOut();
+                location.reload();
+            } catch (e) {
+                showError('Fehler beim Löschen: ' + e.message);
+            }
+        }
+
+        // Save TTS settings on change
+        document.getElementById('settings-tts')?.addEventListener('change', (e) => {
+            localStorage.setItem('cexo_tts', e.target.value);
+        });
+
+        document.getElementById('settings-voice')?.addEventListener('change', (e) => {
+            localStorage.setItem('cexo_voice', e.target.value);
         });
 
         document.getElementById('profile-form').addEventListener('submit', async (e) => {
@@ -926,9 +1323,17 @@ merke sie dir und beziehe dich später darauf.
             apiKeyContainer.classList.add('show');
             statusText.textContent = 'API-Key eingeben';
 
+            // Track login
+            await trackActivity('login');
+            
             await loadUserMemory();
             await loadOrCreateTodaySession();
             await loadChatHistory();
+            
+            // Load new features data
+            sleepPattern = await analyzeSleepPattern();
+            await loadTodayMood();
+            await loadReminders();
         }
 
         // Load User Memory
@@ -1178,6 +1583,11 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n')}`;
                 : `<div class="bot-avatar">C</div><div class="message-content">${escapeHtml(content)}</div>`;
             chatMessages.appendChild(div);
             chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            // Speak bot messages
+            if (!isUser) {
+                speak(content);
+            }
         }
 
         function escapeHtml(text) {
@@ -1213,11 +1623,42 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n')}`;
 
         // Claude API
         async function sendWelcomeMessage() {
-            const welcomePrompt = userProfile?.nenner 
-                ? `Begrüße ${userProfile.nenner} herzlich zurück. Beziehe dich kurz auf das letzte Gespräch wenn vorhanden.`
-                : `Begrüße den User herzlich. Frag nach seinem Namen/wie du ihn nennen sollst.`;
-
             showTyping();
+            
+            // Check if returning user or new
+            const isReturning = userProfile?.nenner || userFacts.length > 0 || recentSummaries.length > 0;
+            
+            // Check for sleep concerns
+            const sleepConcern = getSleepConcernMessage();
+            
+            // Check for due reminders
+            const dueReminders = getPendingRemindersText();
+            
+            let welcomePrompt;
+            if (isReturning && userProfile?.nenner) {
+                // Returning user with name
+                welcomePrompt = `Begrüße ${userProfile.nenner} kurz und herzlich zurück. 
+Maximal 2-3 Sätze.`;
+                
+                if (sleepConcern) {
+                    welcomePrompt += `\nEs ist ${new Date().toLocaleTimeString('de-DE')} Uhr. ${sleepConcern}`;
+                } else if (dueReminders) {
+                    welcomePrompt += `\nErwähne kurz: "${dueReminders}"`;
+                } else {
+                    welcomePrompt += `\nFrag wie es ihm/ihr heute geht.`;
+                }
+            } else if (isReturning) {
+                // Returning but no name
+                welcomePrompt = `Begrüße den User kurz zurück. Maximal 2 Sätze.
+Frag nach seinem Namen, du hattest ihn noch nicht.`;
+            } else {
+                // New user - short onboarding
+                welcomePrompt = `Erste Begrüßung für neuen User.
+WICHTIG: Maximal 2 kurze Sätze!
+Sag nur: "Hey! Ich bin CEXO. Wie darf ich dich nennen? 🖤"
+Nichts weiter erklären, keine langen Texte.`;
+            }
+
             try {
                 const response = await fetch('https://api.anthropic.com/v1/messages', {
                     method: 'POST',
@@ -1229,7 +1670,7 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n')}`;
                     },
                     body: JSON.stringify({
                         model: 'claude-sonnet-4-20250514',
-                        max_tokens: 300,
+                        max_tokens: 100,
                         system: buildSystemPrompt(),
                         messages: [{ role: 'user', content: welcomePrompt }]
                     })
@@ -1243,13 +1684,22 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n')}`;
                 conversationHistory.push({ role: 'assistant', content: msg });
             } catch (e) {
                 hideTyping();
-                addMessage('Hallo! Ich bin CEXO. Schön dass du da bist. 🖤', false);
+                // Fallback
+                const fallback = userProfile?.nenner 
+                    ? `Hey ${userProfile.nenner}! Schön dass du wieder da bist. Wie geht's dir heute? 🖤`
+                    : `Hey! Ich bin CEXO. Wie darf ich dich nennen? 🖤`;
+                addMessage(fallback, false);
+                await saveMessage(fallback, 'assistant');
+                conversationHistory.push({ role: 'assistant', content: fallback });
             }
         }
 
         async function sendMessage() {
             const text = userInput.value.trim();
             if (!text || !isConnected) return;
+
+            // Track activity
+            await trackActivity('message');
 
             addMessage(text, true);
             await saveMessage(text, 'user');
@@ -1351,8 +1801,28 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n')}`;
         sendBtn.addEventListener('click', sendMessage);
         userInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 
+        // TTS Settings listeners
+        document.getElementById('settings-tts')?.addEventListener('change', (e) => {
+            localStorage.setItem('cexo_tts', e.target.value);
+            ttsEnabled = e.target.value === 'on';
+            if (!ttsEnabled) stopSpeaking();
+        });
+
+        document.getElementById('settings-voice')?.addEventListener('change', (e) => {
+            localStorage.setItem('cexo_voice', e.target.value);
+        });
+
         // Init
         (async () => {
+            // Init TTS
+            initTTS();
+            
+            // Load saved API key
+            const savedKey = localStorage.getItem('cexo_api_key');
+            if (savedKey) {
+                apiKeyInput.value = savedKey;
+            }
+
             const { data: { session } } = await supabaseClient.auth.getSession();
             if (session) handleAuthSuccess(session.user);
         })();
